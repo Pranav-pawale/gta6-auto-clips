@@ -1,0 +1,67 @@
+name: GTA 6 Auto Clipper
+
+on:
+  schedule:
+    - cron: '30 5 * * *'   # 11:00 AM IST
+    - cron: '0 15 * * *'   # 8:30 PM IST
+  workflow_dispatch:       # Manual test button
+
+permissions:
+  contents: write
+
+jobs:
+  clip-and-post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg and Python dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install -r requirements.txt
+
+      - name: Fetch, Edit, and Upload to YouTube
+        env:
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+        run: python main.py
+
+      - name: Host Temp Video & Publish to Instagram Reels
+        if: hashFiles('meta.json') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+        run: |
+          TAG="temp-$(date +%s)"
+          gh release create "$TAG" final.mp4 --title "$TAG"
+          VIDEO_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/final.mp4"
+
+          python -c "
+          import json
+          from main import upload_instagram
+          meta = json.load(open('meta.json'))
+          upload_instagram('$VIDEO_URL', meta['ig_caption'])
+          posted = json.load(open('posted_ids.json'))
+          posted.append(meta['clip_id'])
+          json.dump(posted, open('posted_ids.json', 'w'))
+          "
+
+          gh release delete "$TAG" --yes --cleanup-tag
+
+      - name: Save Posted Clip ID
+        if: hashFiles('meta.json') != ''
+        run: |
+          git config user.name "Auto Clipper Bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add posted_ids.json
+          git commit -m "Log posted clip" || exit 0
+          git push
