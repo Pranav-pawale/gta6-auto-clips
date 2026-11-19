@@ -200,6 +200,19 @@ def detect_facecam_box(video_path):
 
     return (xf, yf, wf, hf)
 
+
+def is_bad_word(word):
+    clean = re.sub(r"[^a-zA-Z]", "", word).lower()
+    return clean in BAD_WORDS
+
+
+def format_srt_time(seconds):
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    ms = int((s - int(s)) * 1000)
+    return f"{int(h):02}:{int(m):02}:{int(s):02},{ms:03}"
+
+
 def process_video(clip_url):
     subprocess.run(["yt-dlp", "-f", "best[ext=mp4]/best", "-o", "raw.mp4", clip_url], check=True)
 
@@ -222,7 +235,6 @@ def process_video(clip_url):
                 censored_words = []
                 for w in seg.words:
                     if is_bad_word(w.word):
-                        # Pad slightly so the whole swear word is cleanly beeped
                         beep_ranges.append((max(0.0, w.start - 0.05), w.end + 0.05))
                         censored_words.append("****")
                     else:
@@ -239,7 +251,7 @@ def process_video(clip_url):
 
     print(f"Censored {len(beep_ranges)} offensive word(s).")
 
-    # 2. Auto-detect facecam box via Gemini Vision
+    # 2. Auto-detect & verify facecam box via Gemini Vision
     cam_box = detect_facecam_box("raw.mp4")
     sub_filter = (
         ",subtitles=subs.srt:force_style='FontName=Arial,FontSize=20,Bold=1,PrimaryColour=&H0000FFFF,"
@@ -249,7 +261,7 @@ def process_video(clip_url):
 
     if cam_box:
         xf, yf, wf, hf = cam_box
-        print(f"Facecam detected via Gemini Vision: x={xf:.2f}, y={yf:.2f}, w={wf:.2f}, h={hf:.2f}")
+        print(f"Facecam verified via Gemini Vision: x={xf:.2f}, y={yf:.2f}, w={wf:.2f}, h={hf:.2f}")
         v_fc = (
             f"[0:v]crop=iw*{wf:.4f}:ih*{hf:.4f}:iw*{xf:.4f}:ih*{yf:.4f},"
             f"scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[cam];"
