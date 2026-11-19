@@ -129,7 +129,7 @@ def get_top_clip(token):
     {clip_list}
     """
     resp = client.models.generate_content(
-        model="gemini-2.5-flash-lite",
+        model="gemini-3.5-flash-lite",
         contents=pick_prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json")
     )
@@ -160,7 +160,7 @@ def detect_facecam_box(video_path):
             img_bytes = f.read()
 
         resp = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model="gemini-3.5-flash-lite",
             contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), locate_prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
@@ -300,7 +300,7 @@ def generate_metadata(transcript, streamer_name, clip_title):
     - "ig_caption": 1-line hook + blank line + "Credit: @{streamer_name} (Twitch)" + 4 GTA 6 hashtags
     """
     resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash-lite",
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json")
     )
