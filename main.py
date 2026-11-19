@@ -87,7 +87,10 @@ def process_video(clip_url):
     return " ".join(transcript_text)
 
 def generate_metadata(transcript, streamer_name, clip_title):
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = genai.Client(
+    api_key=os.environ["GEMINI_API_KEY"],
+    http_options={"api_version": "v1beta"}
+    )
     prompt = f"""
     You are a viral gaming shorts editor for GTA 6.
     Streamer: {streamer_name}
