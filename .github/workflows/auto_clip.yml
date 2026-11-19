@@ -12,6 +12,7 @@ permissions:
 jobs:
   clip-and-post:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -19,10 +20,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg and Python dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
-          pip install -r requirements.txt
+      - name: Setup FFmpeg (Fast & Cached)
+        uses: FedericoCarboni/setup-ffmpeg@v3
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
 
       - name: Fetch, Edit, and Upload to YouTube
         env:
