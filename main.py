@@ -3,6 +3,7 @@ import json
 import time
 import subprocess
 import requests
+import cv2
 from datetime import datetime, timedelta, timezone
 from faster_whisper import WhisperModel
 from google import genai
@@ -12,15 +13,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # --- CONFIG ---
-# Twitch usernames & their facecam corner: "tl" (top-left), "tr" (top-right), "bl" (bottom-left), "br" (bottom-right)
-STREAMER_CAMS = {
-    "caseoh_": "bl",
-    "darkviperau": "tl",
-    "summit1g": "tl",
-    "loserfruit": "bl",
-    "kaicenat": "bl",
-}
-WHITELIST_STREAMERS = list(STREAMER_CAMS.keys())
+WHITELIST_STREAMERS = ["caseoh_", "darkviperau", "summit1g", "loserfruit", "kaicenat"]
 POSTED_FILE = "posted_ids.json"
 
 
@@ -56,19 +49,26 @@ def get_top_clip(token):
         params=[("login", u) for u in WHITELIST_STREAMERS]
     ).json().get("data", [])
 
-    started_at = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    candidates = []
+    started_at = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    long_clips = []
+    medium_clips = []
 
     for u in users:
         clips = requests.get("https://api.twitch.tv/helix/clips", headers=headers, params={
             "broadcaster_id": u["id"],
             "started_at": started_at,
-            "first": 10
+            "first": 20
         }).json().get("data", [])
         for c in clips:
-            if c["id"] not in posted and 15 <= c["duration"] <= 55:
-                candidates.append(c)
+            if c["id"] in posted:
+                continue
+            if 45 <= c["duration"] <= 60:
+                long_clips.append(c)
+            elif 30 <= c["duration"] < 45:
+                medium_clips.append(c)
 
+    # Prefer 45-60s clips so the story makes sense; fall back to 30-45s only if needed
+    candidates = long_clips if long_clips else medium_clips
     if not candidates:
         return None
 
@@ -80,9 +80,9 @@ def get_top_clip(token):
 
     client = get_gemini_client()
     pick_prompt = f"""
-    Pick the SINGLE best clip index (0 to {len(top_pool)-1}) for a viral GTA/gaming Short.
-    Prioritize clips where the streamer is angry, shocked, screaming, panicking, laughing hard, or having an emotional/chaotic reaction that works as an instant hook.
-    Avoid boring gameplay, quiet moments, or chill driving/flying.
+    Pick the SINGLE best clip index (0 to {len(top_pool)-1}) for a viral gaming Short.
+    Prioritize clips with a clear story/moment where the streamer is angry, shocked, panicking, or laughing hard.
+    Avoid random mid-action chaos that makes no sense without context.
     Return ONLY JSON: {{"index": <int>}}
 
     Clips:
@@ -97,6 +97,47 @@ def get_top_clip(token):
     return top_pool[idx] if 0 <= idx < len(top_pool) else top_pool[0]
 
 
+def detect_facecam_box(video_path):
+    """Samples frames and returns (x, y, w, h) for the facecam crop, or None if no face found."""
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if total_frames <= 0 or vid_w <= 0:
+        cap.release()
+        return None
+
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    centers = []
+
+    for frac in [0.15, 0.30, 0.45, 0.60, 0.75, 0.85]:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * frac))
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(45, 45))
+        for (fx, fy, fw, fh) in faces:
+            cx, cy = fx + fw / 2, fy + fh / 2
+            # Ignore faces right in the dead-center of gameplay (likely NPCs)
+            if not (vid_w * 0.35 < cx < vid_w * 0.65 and vid_h * 0.30 < cy < vid_h * 0.70):
+                centers.append((cx, cy))
+
+    cap.release()
+    if len(centers) < 2:
+        return None
+
+    avg_x = sum(c[0] for c in centers) / len(centers)
+    avg_y = sum(c[1] for c in centers) / len(centers)
+
+    # Crop a 16:9-ish box around the detected facecam
+    crop_w = int(vid_w * 0.30)
+    crop_h = int(vid_h * 0.32)
+    x = max(0, min(int(avg_x - crop_w / 2), vid_w - crop_w))
+    y = max(0, min(int(avg_y - crop_h / 2), vid_h - crop_h))
+    return (x, y, crop_w, crop_h)
+
+
 def format_srt_time(seconds):
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
@@ -104,13 +145,15 @@ def format_srt_time(seconds):
     return f"{int(h):02}:{int(m):02}:{int(s):02},{ms:03}"
 
 
-def process_video(clip_url, streamer_login):
+def process_video(clip_url):
     subprocess.run(["yt-dlp", "-f", "best[ext=mp4]/best", "-o", "raw.mp4", clip_url], check=True)
 
+    # 1. Transcribe with sensitive VAD so screaming/reactions aren't dropped
     model = WhisperModel("base", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(
         "raw.mp4",
         vad_filter=True,
+        vad_parameters={"threshold": 0.25, "min_silence_duration_ms": 400},
         condition_on_previous_text=False
     )
     transcript_text = []
@@ -125,30 +168,33 @@ def process_video(clip_url, streamer_login):
             srt.write(f"{idx}\n{format_srt_time(seg.start)} --> {format_srt_time(seg.end)}\n{text}\n\n")
             idx += 1
 
-    # Facecam corner coordinates (crops 28% width x 32% height from the streamer's cam corner)
-    cam_pos = STREAMER_CAMS.get(streamer_login.lower(), "bl")
-    cam_coords = {
-        "tl": "0:0",
-        "tr": "iw-iw*0.28:0",
-        "bl": "0:ih-ih*0.32",
-        "br": "iw-iw*0.28:ih-ih*0.32",
-    }[cam_pos]
-
+    # 2. Auto-detect facecam box
+    cam_box = detect_facecam_box("raw.mp4")
     sub_filter = (
-        ",subtitles=subs.srt:force_style='FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=80'"
+        ",subtitles=subs.srt:force_style='FontName=Arial,FontSize=20,Bold=1,PrimaryColour=&H0000FFFF,"
+        "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=90'"
         if transcript_text else ""
     )
 
-    fc = (
-        f"[0:v]crop=iw*0.28:ih*0.32:{cam_coords},scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[cam];"
-        f"[0:v]scale=1080:1280:force_original_aspect_ratio=increase,crop=1080:1280[game];"
-        f"[cam][game]vstack=inputs=2{sub_filter}[outv]"
-    )
+    if cam_box:
+        cx, cy, cw, ch = cam_box
+        print(f"Facecam detected at x={cx}, y={cy}, w={cw}, h={ch}")
+        fc = (
+            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[cam];"
+            f"[0:v]scale=1080:1280:force_original_aspect_ratio=increase,crop=1080:1280[game];"
+            f"[cam][game]vstack=inputs=2{sub_filter}[outv]"
+        )
+    else:
+        print("No facecam detected; using clean full-screen 9:16 crop.")
+        fc = f"[0:v]crop=ih*9/16:ih,scale=1080:1920{sub_filter}[outv]"
+
+    # 3. Render with audio loudness normalization + hard limiter (no ear-blasting screams)
+    af = "loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.8"
 
     subprocess.run([
         "ffmpeg", "-y", "-i", "raw.mp4",
         "-filter_complex", fc, "-map", "[outv]", "-map", "0:a?",
+        "-af", af,
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "23",
         "-c:a", "aac", "-ar", "48000", "-b:a", "128k",
         "-movflags", "+faststart", "final.mp4"
@@ -240,8 +286,8 @@ if __name__ == "__main__":
         print("No new clips found.")
         exit(0)
 
-    print(f"Selected clip: [{clip['broadcaster_name']}] {clip['title']}")
-    transcript = process_video(clip["url"], clip["broadcaster_name"])
+    print(f"Selected clip: [{clip['broadcaster_name']}] {clip['title']} ({int(clip['duration'])}s)")
+    transcript = process_video(clip["url"])
     meta = generate_metadata(transcript, clip["broadcaster_name"], clip["title"])
     upload_youtube(meta)
 
