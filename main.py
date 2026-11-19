@@ -138,7 +138,7 @@ def get_top_clip(token):
 
 
 def detect_facecam_box(video_path):
-    """Extracts 1 frame and asks Gemini Vision for the streamer's facecam bounding box."""
+    """Locates a real-life webcam overlay and verifies the crop actually shows a human face."""
     subprocess.run(
         ["ffmpeg", "-y", "-ss", "5", "-i", video_path, "-frames:v", "1", "frame.jpg"],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -147,14 +147,19 @@ def detect_facecam_box(video_path):
         img_bytes = f.read()
 
     client = get_gemini_client()
-    prompt = (
-        "Look at this Twitch gaming stream screenshot. Is there a real-life streamer facecam/webcam overlay? "
-        "If YES, return JSON: {\"has_cam\": true, \"box_2d\": [ymin, xmin, ymax, xmax]} using 0-1000 normalized coordinates for the webcam box. "
-        "If NO facecam exists (only gameplay), return JSON: {\"has_cam\": false, \"box_2d\": null}."
+
+    # Step 1: Locate the webcam box (explicitly ignoring Twitch chat and game HUD)
+    locate_prompt = (
+        "Look at this Twitch gaming stream screenshot. "
+        "Is there a REAL-LIFE HUMAN PERSON visible in a webcam/facecam overlay? "
+        "STRICT RULES: Ignore Twitch chat overlays, subscriber alerts, minimaps, HUDs, and in-game 3D characters. "
+        "Only return true if you can clearly see a real human sitting in front of a camera. "
+        "If YES, return JSON: {\"has_cam\": true, \"box_2d\": [ymin, xmin, ymax, xmax]} (0-1000 normalized coordinates tightly around the webcam). "
+        "If NO, return JSON: {\"has_cam\": false, \"box_2d\": null}."
     )
     resp = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), prompt],
+        contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), locate_prompt],
         config=types.GenerateContentConfig(response_mime_type="application/json")
     )
     data = json.loads(resp.text)
@@ -162,24 +167,38 @@ def detect_facecam_box(video_path):
         return None
 
     ymin, xmin, ymax, xmax = data["box_2d"]
-    xf, yf = xmin / 1000.0, ymin / 1000.0
+    xf, yf = max(0.0, xmin / 1000.0), max(0.0, ymin / 1000.0)
     wf, hf = (xmax - xmin) / 1000.0, (ymax - ymin) / 1000.0
-    if wf < 0.08 or hf < 0.08 or wf > 0.65 or hf > 0.65:
+    if wf < 0.08 or hf < 0.08 or wf > 0.60 or hf > 0.60:
         return None
+
+    # Step 2: Crop that exact box and verify it actually contains a real human face
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", "frame.jpg",
+            "-vf", f"crop=iw*{wf:.4f}:ih*{hf:.4f}:iw*{xf:.4f}:ih*{yf:.4f}",
+            "cam_check.jpg"
+        ],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    with open("cam_check.jpg", "rb") as f:
+        crop_bytes = f.read()
+
+    verify_prompt = (
+        "Does this cropped image clearly show a real-life human face/person on a webcam? "
+        "Answer false if it is a chat box, text, dark background, gameplay, or empty room. "
+        "Return ONLY JSON: {\"is_real_facecam\": true/false}"
+    )
+    v_resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[types.Part.from_bytes(data=crop_bytes, mime_type="image/jpeg"), verify_prompt],
+        config=types.GenerateContentConfig(response_mime_type="application/json")
+    )
+    if not json.loads(v_resp.text).get("is_real_facecam"):
+        print("Facecam verification failed (not a real human face); falling back to full-screen.")
+        return None
+
     return (xf, yf, wf, hf)
-
-
-def is_bad_word(word):
-    clean = re.sub(r"[^a-zA-Z]", "", word).lower()
-    return clean in BAD_WORDS
-
-
-def format_srt_time(seconds):
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    ms = int((s - int(s)) * 1000)
-    return f"{int(h):02}:{int(m):02}:{int(s):02},{ms:03}"
-
 
 def process_video(clip_url):
     subprocess.run(["yt-dlp", "-f", "best[ext=mp4]/best", "-o", "raw.mp4", clip_url], check=True)
