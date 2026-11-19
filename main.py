@@ -131,8 +131,8 @@ def upload_youtube(meta):
     print("YouTube upload complete (Private).")
 
 def upload_instagram(public_video_url, caption):
-    ig_id = os.environ["IG_USER_ID"]
-    token = os.environ["IG_ACCESS_TOKEN"]
+    ig_id = os.environ["IG_USER_ID"].strip()
+    token = os.environ["IG_ACCESS_TOKEN"].strip()
     base = "https://graph.facebook.com/v21.0"
 
     c_res = requests.post(f"{base}/{ig_id}/media", data={
@@ -142,6 +142,8 @@ def upload_instagram(public_video_url, caption):
         "share_to_feed": "true",
         "access_token": token
     }).json()
+    if "id" not in c_res:
+        raise RuntimeError(f"Instagram API Error: {c_res}")
     creation_id = c_res["id"]
 
     for _ in range(20):
