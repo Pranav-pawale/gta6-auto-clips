@@ -22,9 +22,9 @@ jobs:
 
       - name: Setup FFmpeg
         run: |
-          if ! command -v ffmpeg &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y ffmpeg
-          fi
+          curl -L https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o ffmpeg.tar.xz
+          tar -xf ffmpeg.tar.xz --strip-components=2 -C /usr/local/bin --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+          rm ffmpeg.tar.xz
           ffmpeg -version | head -n 1
 
       - name: Install Python dependencies
