@@ -17,11 +17,13 @@ WHITELIST_STREAMERS = ["caseoh_", "darkviperau", "summit1g", "loserfruit", "kaic
 POSTED_FILE = "posted_ids.json"
 
 def get_twitch_token():
-    r = requests.post("https://id.twitch.tv/oauth2/token", params={
-        "client_id": os.environ["TWITCH_CLIENT_ID"],
-        "client_secret": os.environ["TWITCH_CLIENT_SECRET"],
+    r = requests.post("https://id.twitch.tv/oauth2/token", data={
+        "client_id": os.environ["TWITCH_CLIENT_ID"].strip(),
+        "client_secret": os.environ["TWITCH_CLIENT_SECRET"].strip(),
         "grant_type": "client_credentials"
     }).json()
+    if "access_token" not in r:
+        raise RuntimeError(f"Twitch Auth Failed: {r}")
     return r["access_token"]
 
 def get_top_clip(token):
