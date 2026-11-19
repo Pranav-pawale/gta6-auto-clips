@@ -138,67 +138,47 @@ def get_top_clip(token):
 
 
 def detect_facecam_box(video_path):
-    """Locates a real-life webcam overlay and verifies the crop actually shows a human face."""
-    subprocess.run(
-        ["ffmpeg", "-y", "-ss", "5", "-i", video_path, "-frames:v", "1", "frame.jpg"],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    with open("frame.jpg", "rb") as f:
-        img_bytes = f.read()
-
+    """Checks 3 timestamps to reliably locate a real-life streamer facecam."""
     client = get_gemini_client()
-
-    # Step 1: Locate the webcam box (explicitly ignoring Twitch chat and game HUD)
     locate_prompt = (
-        "Look at this Twitch gaming stream screenshot. "
-        "Is there a REAL-LIFE HUMAN PERSON visible in a webcam/facecam overlay? "
-        "STRICT RULES: Ignore Twitch chat overlays, subscriber alerts, minimaps, HUDs, and in-game 3D characters. "
-        "Only return true if you can clearly see a real human sitting in front of a camera. "
-        "If YES, return JSON: {\"has_cam\": true, \"box_2d\": [ymin, xmin, ymax, xmax]} (0-1000 normalized coordinates tightly around the webcam). "
-        "If NO, return JSON: {\"has_cam\": false, \"box_2d\": null}."
+        "Find the real-life human streamer's webcam/facecam overlay in this Twitch gaming screenshot. "
+        "Note: Streamers often sit in dark rooms, wear headsets, or use green screens—that STILL counts as a facecam. "
+        "Ignore Twitch chat text boxes, game minimaps, and in-game 3D characters. "
+        "If a real human webcam is visible, return JSON: "
+        "{\"has_cam\": true, \"box_2d\": [ymin, xmin, ymax, xmax]} (0-1000 normalized coordinates around the webcam/person). "
+        "If there is NO real human webcam anywhere on screen, return JSON: {\"has_cam\": false, \"box_2d\": null}."
     )
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), locate_prompt],
-        config=types.GenerateContentConfig(response_mime_type="application/json")
-    )
-    data = json.loads(resp.text)
-    if not data.get("has_cam") or not data.get("box_2d"):
-        return None
 
-    ymin, xmin, ymax, xmax = data["box_2d"]
-    xf, yf = max(0.0, xmin / 1000.0), max(0.0, ymin / 1000.0)
-    wf, hf = (xmax - xmin) / 1000.0, (ymax - ymin) / 1000.0
-    if wf < 0.08 or hf < 0.08 or wf > 0.60 or hf > 0.60:
-        return None
+    for ts in ["2", "15", "30"]:
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", ts, "-i", video_path, "-frames:v", "1", "frame.jpg"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if not os.path.exists("frame.jpg"):
+            continue
+        with open("frame.jpg", "rb") as f:
+            img_bytes = f.read()
 
-    # Step 2: Crop that exact box and verify it actually contains a real human face
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", "frame.jpg",
-            "-vf", f"crop=iw*{wf:.4f}:ih*{hf:.4f}:iw*{xf:.4f}:ih*{yf:.4f}",
-            "cam_check.jpg"
-        ],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    with open("cam_check.jpg", "rb") as f:
-        crop_bytes = f.read()
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), locate_prompt],
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        data = json.loads(resp.text)
+        if not data.get("has_cam") or not data.get("box_2d"):
+            continue
 
-    verify_prompt = (
-        "Does this cropped image clearly show a real-life human face/person on a webcam? "
-        "Answer false if it is a chat box, text, dark background, gameplay, or empty room. "
-        "Return ONLY JSON: {\"is_real_facecam\": true/false}"
-    )
-    v_resp = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[types.Part.from_bytes(data=crop_bytes, mime_type="image/jpeg"), verify_prompt],
-        config=types.GenerateContentConfig(response_mime_type="application/json")
-    )
-    if not json.loads(v_resp.text).get("is_real_facecam"):
-        print("Facecam verification failed (not a real human face); falling back to full-screen.")
-        return None
+        ymin, xmin, ymax, xmax = data["box_2d"]
+        # Add slight padding so the streamer's head/shoulders aren't cut off
+        xf = max(0.0, (xmin / 1000.0) - 0.02)
+        yf = max(0.0, (ymin / 1000.0) - 0.02)
+        wf = min(1.0 - xf, ((xmax - xmin) / 1000.0) + 0.04)
+        hf = min(1.0 - yf, ((ymax - ymin) / 1000.0) + 0.04)
 
-    return (xf, yf, wf, hf)
+        if 0.06 <= wf <= 0.65 and 0.06 <= hf <= 0.65:
+            return (xf, yf, wf, hf)
+
+    return None
 
 
 def is_bad_word(word):
@@ -216,7 +196,7 @@ def format_srt_time(seconds):
 def process_video(clip_url):
     subprocess.run(["yt-dlp", "-f", "best[ext=mp4]/best", "-o", "raw.mp4", clip_url], check=True)
 
-    # 1. Transcribe with word-level timestamps to detect & beep bad words
+    # 1. Transcribe with word-level timestamps to detect & beep bad words + build 3-word minimal captions
     model = WhisperModel("base", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(
         "raw.mp4",
@@ -232,36 +212,45 @@ def process_video(clip_url):
         idx = 1
         for seg in segments:
             if seg.words:
-                censored_words = []
-                for w in seg.words:
-                    if is_bad_word(w.word):
-                        beep_ranges.append((max(0.0, w.start - 0.05), w.end + 0.05))
-                        censored_words.append("****")
-                    else:
-                        censored_words.append(w.word.strip())
-                text = " ".join(censored_words).strip()
+                # Split into 3-word chunks so captions stay short and never cover the screen
+                for i in range(0, len(seg.words), 3):
+                    chunk = seg.words[i:i + 3]
+                    censored = []
+                    for w in chunk:
+                        if is_bad_word(w.word):
+                            beep_ranges.append((max(0.0, w.start - 0.05), w.end + 0.05))
+                            censored.append("****")
+                        else:
+                            censored.append(w.word.strip())
+                    text = " ".join(censored).strip()
+                    if not text:
+                        continue
+                    transcript_text.append(text)
+                    srt.write(
+                        f"{idx}\n{format_srt_time(chunk[0].start)} --> {format_srt_time(chunk[-1].end)}\n{text}\n\n"
+                    )
+                    idx += 1
             else:
                 text = seg.text.strip()
-
-            if not text:
-                continue
-            transcript_text.append(text)
-            srt.write(f"{idx}\n{format_srt_time(seg.start)} --> {format_srt_time(seg.end)}\n{text}\n\n")
-            idx += 1
+                if not text:
+                    continue
+                transcript_text.append(text)
+                srt.write(f"{idx}\n{format_srt_time(seg.start)} --> {format_srt_time(seg.end)}\n{text}\n\n")
+                idx += 1
 
     print(f"Censored {len(beep_ranges)} offensive word(s).")
 
-    # 2. Auto-detect & verify facecam box via Gemini Vision
+    # 2. Auto-detect facecam box via Gemini Vision
     cam_box = detect_facecam_box("raw.mp4")
     sub_filter = (
-        ",subtitles=subs.srt:force_style='FontName=Arial,FontSize=20,Bold=1,PrimaryColour=&H0000FFFF,"
-        "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=90'"
+        ",subtitles=subs.srt:force_style='FontName=Arial,FontSize=11,Bold=1,PrimaryColour=&H00FFFFFF,"
+        "OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=0,Alignment=5'"
         if transcript_text else ""
     )
 
     if cam_box:
         xf, yf, wf, hf = cam_box
-        print(f"Facecam verified via Gemini Vision: x={xf:.2f}, y={yf:.2f}, w={wf:.2f}, h={hf:.2f}")
+        print(f"Facecam detected via Gemini Vision: x={xf:.2f}, y={yf:.2f}, w={wf:.2f}, h={hf:.2f}")
         v_fc = (
             f"[0:v]crop=iw*{wf:.4f}:ih*{hf:.4f}:iw*{xf:.4f}:ih*{yf:.4f},"
             f"scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[cam];"
