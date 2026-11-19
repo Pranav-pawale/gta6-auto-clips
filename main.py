@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import subprocess
@@ -13,7 +14,17 @@ from googleapiclient.http import MediaFileUpload
 
 # --- CONFIG ---
 WHITELIST_STREAMERS = ["caseoh_", "darkviperau", "summit1g", "loserfruit", "kaicenat"]
+TARGET_GAME_NAME = "Grand Theft Auto VI"
 POSTED_FILE = "posted_ids.json"
+
+# Words/slangs to automatically beep out in audio and censor in subtitles
+BAD_WORDS = {
+    "fuck", "fucking", "fucked", "fucker", "motherfucker", "motherfucking", "fucks",
+    "shit", "shitty", "bullshit", "shitting", "bitch", "bitches", "bitching",
+    "asshole", "bastard", "dick", "dickhead", "pussy", "cunt", "whore", "slut",
+    "nigga", "niggas", "nigger", "niggers", "faggot", "fag", "retard", "retarded",
+    "cock", "cocksucker", "tits", "twat", "wanker", "stfu", "wtf"
+}
 
 
 def get_gemini_client():
@@ -34,6 +45,15 @@ def get_twitch_token():
     return r["access_token"]
 
 
+def get_game_id(headers, game_name):
+    r = requests.get(
+        "https://api.twitch.tv/helix/games",
+        headers=headers,
+        params={"name": game_name}
+    ).json().get("data", [])
+    return r[0]["id"] if r else None
+
+
 def get_top_clip(token):
     headers = {
         "Client-ID": os.environ["TWITCH_CLIENT_ID"].strip(),
@@ -42,21 +62,43 @@ def get_top_clip(token):
     with open(POSTED_FILE, "r") as f:
         posted = set(json.load(f))
 
+    gta6_id = get_game_id(headers, TARGET_GAME_NAME)
+    if not gta6_id:
+        print(f"Could not find Twitch category for '{TARGET_GAME_NAME}'.")
+        return None
+
+    started_at = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    long_clips = []
+    medium_clips = []
+
+    # 1. Check whitelisted streamers strictly for GTA 6 clips
     users = requests.get(
         "https://api.twitch.tv/helix/users",
         headers=headers,
         params=[("login", u) for u in WHITELIST_STREAMERS]
     ).json().get("data", [])
 
-    started_at = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
-    long_clips = []
-    medium_clips = []
-
     for u in users:
         clips = requests.get("https://api.twitch.tv/helix/clips", headers=headers, params={
             "broadcaster_id": u["id"],
             "started_at": started_at,
             "first": 20
+        }).json().get("data", [])
+        for c in clips:
+            if c["id"] in posted or c.get("game_id") != gta6_id:
+                continue
+            if 45 <= c["duration"] <= 60:
+                long_clips.append(c)
+            elif 30 <= c["duration"] < 45:
+                medium_clips.append(c)
+
+    # 2. If none of the whitelisted streamers played GTA 6 recently, pull top clips from the GTA 6 category
+    if not long_clips and not medium_clips:
+        print("No whitelisted GTA 6 clips found; fetching top clips from GTA 6 category...")
+        clips = requests.get("https://api.twitch.tv/helix/clips", headers=headers, params={
+            "game_id": gta6_id,
+            "started_at": started_at,
+            "first": 50
         }).json().get("data", [])
         for c in clips:
             if c["id"] in posted:
@@ -66,7 +108,6 @@ def get_top_clip(token):
             elif 30 <= c["duration"] < 45:
                 medium_clips.append(c)
 
-    # Prefer 45-60s clips so the story makes sense; fall back to 30-45s only if needed
     candidates = long_clips if long_clips else medium_clips
     if not candidates:
         return None
@@ -79,9 +120,9 @@ def get_top_clip(token):
 
     client = get_gemini_client()
     pick_prompt = f"""
-    Pick the SINGLE best clip index (0 to {len(top_pool)-1}) for a viral gaming Short.
-    Prioritize clips with a clear story/moment where the streamer is angry, shocked, panicking, or laughing hard.
-    Avoid random mid-action chaos that makes no sense without context.
+    Pick the SINGLE best GTA 6 clip index (0 to {len(top_pool)-1}) for a viral gaming Short.
+    Prioritize clips with a clear story/moment where the streamer is surprised, excited, panicking, or laughing hard.
+    Avoid clips with profanity/slurs in the title or boring/quiet gameplay.
     Return ONLY JSON: {{"index": <int>}}
 
     Clips:
@@ -128,6 +169,11 @@ def detect_facecam_box(video_path):
     return (xf, yf, wf, hf)
 
 
+def is_bad_word(word):
+    clean = re.sub(r"[^a-zA-Z]", "", word).lower()
+    return clean in BAD_WORDS
+
+
 def format_srt_time(seconds):
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
@@ -138,25 +184,41 @@ def format_srt_time(seconds):
 def process_video(clip_url):
     subprocess.run(["yt-dlp", "-f", "best[ext=mp4]/best", "-o", "raw.mp4", clip_url], check=True)
 
-    # 1. Transcribe with sensitive VAD so screaming/reactions aren't dropped
+    # 1. Transcribe with word-level timestamps to detect & beep bad words
     model = WhisperModel("base", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(
         "raw.mp4",
         vad_filter=True,
         vad_parameters={"threshold": 0.25, "min_silence_duration_ms": 400},
-        condition_on_previous_text=False
+        condition_on_previous_text=False,
+        word_timestamps=True
     )
     transcript_text = []
+    beep_ranges = []
 
     with open("subs.srt", "w", encoding="utf-8") as srt:
         idx = 1
         for seg in segments:
-            text = seg.text.strip()
+            if seg.words:
+                censored_words = []
+                for w in seg.words:
+                    if is_bad_word(w.word):
+                        # Pad slightly so the whole swear word is cleanly beeped
+                        beep_ranges.append((max(0.0, w.start - 0.05), w.end + 0.05))
+                        censored_words.append("****")
+                    else:
+                        censored_words.append(w.word.strip())
+                text = " ".join(censored_words).strip()
+            else:
+                text = seg.text.strip()
+
             if not text:
                 continue
             transcript_text.append(text)
             srt.write(f"{idx}\n{format_srt_time(seg.start)} --> {format_srt_time(seg.end)}\n{text}\n\n")
             idx += 1
+
+    print(f"Censored {len(beep_ranges)} offensive word(s).")
 
     # 2. Auto-detect facecam box via Gemini Vision
     cam_box = detect_facecam_box("raw.mp4")
@@ -169,7 +231,7 @@ def process_video(clip_url):
     if cam_box:
         xf, yf, wf, hf = cam_box
         print(f"Facecam detected via Gemini Vision: x={xf:.2f}, y={yf:.2f}, w={wf:.2f}, h={hf:.2f}")
-        fc = (
+        v_fc = (
             f"[0:v]crop=iw*{wf:.4f}:ih*{hf:.4f}:iw*{xf:.4f}:ih*{yf:.4f},"
             f"scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[cam];"
             f"[0:v]scale=1080:1280:force_original_aspect_ratio=increase,crop=1080:1280[game];"
@@ -177,15 +239,25 @@ def process_video(clip_url):
         )
     else:
         print("No facecam detected; using clean full-screen 9:16 crop.")
-        fc = f"[0:v]crop=ih*9/16:ih,scale=1080:1920{sub_filter}[outv]"
+        v_fc = f"[0:v]crop=ih*9/16:ih,scale=1080:1920{sub_filter}[outv]"
 
-    # 3. Render with audio loudness normalization + hard limiter (no ear-blasting screams)
-    af = "loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.8"
+    # 3. Audio: beep out offensive words + loudness normalization + limiter
+    if beep_ranges:
+        cond = "+".join(f"between(t,{s:.2f},{e:.2f})" for s, e in beep_ranges)
+        a_fc = (
+            f"[0:a]volume=enable='{cond}':volume=0[muted];"
+            f"sine=frequency=1000:sample_rate=48000,volume=0.25,volume=enable='not({cond})':volume=0[beep];"
+            f"[muted][beep]amix=inputs=2:duration=first:dropout_transition=0,"
+            f"loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.8[outa]"
+        )
+    else:
+        a_fc = "[0:a]loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.8[outa]"
+
+    full_fc = f"{v_fc};{a_fc}"
 
     subprocess.run([
         "ffmpeg", "-y", "-i", "raw.mp4",
-        "-filter_complex", fc, "-map", "[outv]", "-map", "0:a?",
-        "-af", af,
+        "-filter_complex", full_fc, "-map", "[outv]", "-map", "[outa]",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "23",
         "-c:a", "aac", "-ar", "48000", "-b:a", "128k",
         "-movflags", "+faststart", "final.mp4"
@@ -202,7 +274,7 @@ def generate_metadata(transcript, streamer_name, clip_title):
     Original Clip Title: {clip_title}
     Transcript: {transcript}
 
-    Return ONLY valid JSON with these keys:
+    Return ONLY valid JSON with these keys (keep all text family-friendly, no profanity):
     - "yt_title": Punchy curiosity-driven title under 65 characters + #shorts
     - "yt_description": 2 short lines of context + "Credit: @{streamer_name} on Twitch" + 4 GTA 6 hashtags
     - "ig_caption": 1-line hook + blank line + "Credit: @{streamer_name} (Twitch)" + 4 GTA 6 hashtags
@@ -274,10 +346,10 @@ if __name__ == "__main__":
     token = get_twitch_token()
     clip = get_top_clip(token)
     if not clip:
-        print("No new clips found.")
+        print("No new GTA 6 clips found.")
         exit(0)
 
-    print(f"Selected clip: [{clip['broadcaster_name']}] {clip['title']} ({int(clip['duration'])}s)")
+    print(f"Selected GTA 6 clip: [{clip['broadcaster_name']}] {clip['title']} ({int(clip['duration'])}s)")
     transcript = process_video(clip["url"])
     meta = generate_metadata(transcript, clip["broadcaster_name"], clip["title"])
     upload_youtube(meta)
