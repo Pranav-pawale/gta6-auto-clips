@@ -3,7 +3,6 @@ import json
 import time
 import subprocess
 import requests
-import cv2
 from datetime import datetime, timedelta, timezone
 from faster_whisper import WhisperModel
 from google import genai
@@ -98,44 +97,35 @@ def get_top_clip(token):
 
 
 def detect_facecam_box(video_path):
-    """Samples frames and returns (x, y, w, h) for the facecam crop, or None if no face found."""
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if total_frames <= 0 or vid_w <= 0:
-        cap.release()
+    """Extracts 1 frame and asks Gemini Vision for the streamer's facecam bounding box."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-ss", "5", "-i", video_path, "-frames:v", "1", "frame.jpg"],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    with open("frame.jpg", "rb") as f:
+        img_bytes = f.read()
+
+    client = get_gemini_client()
+    prompt = (
+        "Look at this Twitch gaming stream screenshot. Is there a real-life streamer facecam/webcam overlay? "
+        "If YES, return JSON: {\"has_cam\": true, \"box_2d\": [ymin, xmin, ymax, xmax]} using 0-1000 normalized coordinates for the webcam box. "
+        "If NO facecam exists (only gameplay), return JSON: {\"has_cam\": false, \"box_2d\": null}."
+    )
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), prompt],
+        config=types.GenerateContentConfig(response_mime_type="application/json")
+    )
+    data = json.loads(resp.text)
+    if not data.get("has_cam") or not data.get("box_2d"):
         return None
 
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    centers = []
-
-    for frac in [0.15, 0.30, 0.45, 0.60, 0.75, 0.85]:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * frac))
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(45, 45))
-        for (fx, fy, fw, fh) in faces:
-            cx, cy = fx + fw / 2, fy + fh / 2
-            # Ignore faces right in the dead-center of gameplay (likely NPCs)
-            if not (vid_w * 0.35 < cx < vid_w * 0.65 and vid_h * 0.30 < cy < vid_h * 0.70):
-                centers.append((cx, cy))
-
-    cap.release()
-    if len(centers) < 2:
+    ymin, xmin, ymax, xmax = data["box_2d"]
+    xf, yf = xmin / 1000.0, ymin / 1000.0
+    wf, hf = (xmax - xmin) / 1000.0, (ymax - ymin) / 1000.0
+    if wf < 0.08 or hf < 0.08 or wf > 0.65 or hf > 0.65:
         return None
-
-    avg_x = sum(c[0] for c in centers) / len(centers)
-    avg_y = sum(c[1] for c in centers) / len(centers)
-
-    # Crop a 16:9-ish box around the detected facecam
-    crop_w = int(vid_w * 0.30)
-    crop_h = int(vid_h * 0.32)
-    x = max(0, min(int(avg_x - crop_w / 2), vid_w - crop_w))
-    y = max(0, min(int(avg_y - crop_h / 2), vid_h - crop_h))
-    return (x, y, crop_w, crop_h)
+    return (xf, yf, wf, hf)
 
 
 def format_srt_time(seconds):
@@ -168,7 +158,7 @@ def process_video(clip_url):
             srt.write(f"{idx}\n{format_srt_time(seg.start)} --> {format_srt_time(seg.end)}\n{text}\n\n")
             idx += 1
 
-    # 2. Auto-detect facecam box
+    # 2. Auto-detect facecam box via Gemini Vision
     cam_box = detect_facecam_box("raw.mp4")
     sub_filter = (
         ",subtitles=subs.srt:force_style='FontName=Arial,FontSize=20,Bold=1,PrimaryColour=&H0000FFFF,"
@@ -177,10 +167,11 @@ def process_video(clip_url):
     )
 
     if cam_box:
-        cx, cy, cw, ch = cam_box
-        print(f"Facecam detected at x={cx}, y={cy}, w={cw}, h={ch}")
+        xf, yf, wf, hf = cam_box
+        print(f"Facecam detected via Gemini Vision: x={xf:.2f}, y={yf:.2f}, w={wf:.2f}, h={hf:.2f}")
         fc = (
-            f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[cam];"
+            f"[0:v]crop=iw*{wf:.4f}:ih*{hf:.4f}:iw*{xf:.4f}:ih*{yf:.4f},"
+            f"scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[cam];"
             f"[0:v]scale=1080:1280:force_original_aspect_ratio=increase,crop=1080:1280[game];"
             f"[cam][game]vstack=inputs=2{sub_filter}[outv]"
         )
@@ -239,11 +230,11 @@ def upload_youtube(meta):
             "description": meta["yt_description"],
             "categoryId": "20"
         },
-        "status": {"privacyStatus": "private"}
+        "status": {"privacyStatus": "public"}
     }
     media = MediaFileUpload("final.mp4", mimetype="video/mp4", resumable=True)
     yt.videos().insert(part="snippet,status", body=body, media_body=media).execute()
-    print("YouTube upload complete (Private).")
+    print("YouTube upload complete (Public).")
 
 
 def upload_instagram(public_video_url, caption):
