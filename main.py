@@ -211,4 +211,220 @@ def process_video(clip_url):
     # 1. Transcribe with word-level timestamps for audio censorship + 3-word minimal captions
     model = WhisperModel("base", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(
-        "raw.mp4
+        "raw.mp4",
+        vad_filter=True,
+        vad_parameters={"threshold": 0.25, "min_silence_duration_ms": 400},
+        condition_on_previous_text=False,
+        word_timestamps=True
+    )
+    transcript_text = []
+    beep_ranges = []
+
+    with open("subs.srt", "w", encoding="utf-8") as srt:
+        idx = 1
+        for seg in segments:
+            if seg.words:
+                for i in range(0, len(seg.words), 3):
+                    chunk = seg.words[i:i + 3]
+                    censored = []
+                    for w in chunk:
+                        if is_bad_word(w.word):
+                            beep_ranges.append((max(0.0, w.start - 0.05), w.end + 0.05))
+                            censored.append("****")
+                        else:
+                            censored.append(w.word.strip())
+                    text = " ".join(censored).strip()
+                    if not text:
+                        continue
+                    transcript_text.append(text)
+                    srt.write(
+                        f"{idx}\n{format_srt_time(chunk[0].start)} --> {format_srt_time(chunk[-1].end)}\n{text}\n\n"
+                    )
+                    idx += 1
+            else:
+                text = seg.text.strip()
+                if not text:
+                    continue
+                transcript_text.append(text)
+                srt.write(f"{idx}\n{format_srt_time(seg.start)} --> {format_srt_time(seg.end)}\n{text}\n\n")
+                idx += 1
+
+    print(f"Censored {len(beep_ranges)} offensive word(s).")
+
+    # 2. Auto-detect facecam box via Gemini Vision
+    cam_box = detect_facecam_box("raw.mp4")
+    sub_filter = (
+        ",subtitles=subs.srt:force_style='FontName=Arial,FontSize=11,Bold=1,PrimaryColour=&H00FFFFFF,"
+        "OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=0,Alignment=5'"
+        if transcript_text else ""
+    )
+
+    if cam_box:
+        xf, yf, wf, hf = cam_box
+        print(f"Facecam detected via Gemini Vision: x={xf:.2f}, y={yf:.2f}, w={wf:.2f}, h={hf:.2f}")
+        v_fc = (
+            f"[0:v]crop=iw*{wf:.4f}:ih*{hf:.4f}:iw*{xf:.4f}:ih*{yf:.4f},"
+            f"scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[cam];"
+            f"[0:v]scale=1080:1280:force_original_aspect_ratio=increase,crop=1080:1280[game];"
+            f"[cam][game]vstack=inputs=2{sub_filter}[outv]"
+        )
+    else:
+        print("No facecam detected; using clean full-screen 9:16 crop.")
+        v_fc = f"[0:v]crop=ih*9/16:ih,scale=1080:1920{sub_filter}[outv]"
+
+    # 3. Audio: beep out offensive words + loudness normalization + limiter
+    if beep_ranges:
+        cond = "+".join(f"between(t,{s:.2f},{e:.2f})" for s, e in beep_ranges)
+        a_fc = (
+            f"[0:a]volume=enable='{cond}':volume=0[muted];"
+            f"sine=frequency=1000:sample_rate=48000,volume=0.25,volume=enable='not({cond})':volume=0[beep];"
+            f"[muted][beep]amix=inputs=2:duration=first:dropout_transition=0,"
+            f"loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.8[outa]"
+        )
+    else:
+        a_fc = "[0:a]loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.8[outa]"
+
+    full_fc = f"{v_fc};{a_fc}"
+
+    subprocess.run([
+        "ffmpeg", "-y", "-i", "raw.mp4",
+        "-filter_complex", full_fc, "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-ar", "48000", "-b:a", "128k",
+        "-movflags", "+faststart", "final.mp4"
+    ], check=True)
+
+    return " ".join(transcript_text)
+
+
+def sanitize_yt_tags(raw_tags, streamer_name):
+    """Ensures YouTube tags are clean strings and stay safely under YouTube's 500-char total limit."""
+    defaults = ["GTA 6", "GTA VI", "Grand Theft Auto VI", "GTA 6 Clips", "GTA 6 Shorts", "Gaming Shorts", streamer_name]
+    combined = list(dict.fromkeys([str(t).strip().lstrip("#") for t in (raw_tags or []) + defaults if str(t).strip()]))
+    final_tags = []
+    total_len = 0
+    for tag in combined:
+        if len(tag) > 30:
+            continue
+        if total_len + len(tag) + 1 > 450:
+            break
+        final_tags.append(tag)
+        total_len += len(tag) + 1
+    return final_tags
+
+
+def generate_metadata(transcript, streamer_name, clip_title):
+    client = get_gemini_client()
+    prompt = f"""
+    You are a viral gaming Shorts & Reels growth strategist for a GTA 6 clips channel.
+    Streamer: {streamer_name}
+    Original Clip Title: {clip_title}
+    Transcript: {transcript}
+
+    Return ONLY valid JSON with these exact keys (keep all text family-friendly, zero profanity):
+    - "yt_title": Scroll-stopping, curiosity-gap title under 55 characters + " #shorts" (total under 65 chars).
+    - "yt_description":
+        Line 1: Punchy 1-sentence summary of the moment.
+        Line 2: Short engagement question or CTA ("Subscribe for daily GTA 6 moments!").
+        Line 3: Blank line.
+        Line 4: "Credit: @{streamer_name} on Twitch"
+        Line 5: Blank line.
+        Line 6: 7 high-reach hashtags including #GTA6 #GTAVI #GrandTheftAuto6 #Shorts #GamingShorts #TwitchClips and #{streamer_name}
+    - "yt_tags": JSON array of 12-15 SEO keywords/phrases (no # symbol), e.g. ["GTA 6", "GTA VI gameplay", "{streamer_name} GTA 6", "GTA 6 funny moments", ...].
+    - "ig_caption":
+        Line 1: Viral 1-line hook + emoji.
+        Line 2: Short question to trigger comments (e.g., "Would you have survived this? 👇").
+        Line 3: Blank line.
+        Line 4: "Follow for daily GTA 6 clips 🔥"
+        Line 5: "Credit: @{streamer_name} (Twitch)"
+        Line 6: Blank line.
+        Line 7: 9 targeted hashtags mixing broad + niche (#gta6 #gtavi #grandtheftauto6 #gtaclips #gamingreels #twitchclips #gamingshorts #rockstargames #{streamer_name}).
+    """
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json")
+    )
+    meta = json.loads(resp.text)
+    meta["yt_tags"] = sanitize_yt_tags(meta.get("yt_tags", []), streamer_name)
+    return meta
+
+
+def upload_youtube(meta):
+    creds = Credentials(
+        token=None,
+        refresh_token=os.environ["YT_REFRESH_TOKEN"].strip(),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=os.environ["YT_CLIENT_ID"].strip(),
+        client_secret=os.environ["YT_CLIENT_SECRET"].strip()
+    )
+    yt = build("youtube", "v3", credentials=creds)
+    body = {
+        "snippet": {
+            "title": meta["yt_title"][:100],
+            "description": meta["yt_description"],
+            "tags": meta["yt_tags"],
+            "categoryId": "20",
+            "defaultLanguage": "en",
+            "defaultAudioLanguage": "en"
+        },
+        "status": {
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+            "embeddable": True,
+            "publicStatsViewable": True
+        }
+    }
+    media = MediaFileUpload("final.mp4", mimetype="video/mp4", resumable=True)
+    yt.videos().insert(part="snippet,status", body=body, media_body=media).execute()
+    print(f"YouTube upload complete (Public) with {len(meta['yt_tags'])} SEO tags.")
+
+
+def upload_instagram(public_video_url, caption):
+    ig_id = os.environ["IG_USER_ID"].strip()
+    token = os.environ["IG_ACCESS_TOKEN"].strip()
+    base = "https://graph.facebook.com/v21.0"
+
+    c_res = requests.post(f"{base}/{ig_id}/media", data={
+        "media_type": "REELS",
+        "video_url": public_video_url,
+        "caption": caption,
+        "share_to_feed": "true",
+        "thumb_offset": "2000",
+        "access_token": token
+    }).json()
+    if "id" not in c_res:
+        raise RuntimeError(f"Instagram API Error: {c_res}")
+    creation_id = c_res["id"]
+
+    for _ in range(20):
+        status = requests.get(f"{base}/{creation_id}", params={
+            "fields": "status_code", "access_token": token
+        }).json().get("status_code")
+        if status == "FINISHED":
+            break
+        if status == "ERROR":
+            raise RuntimeError(f"Instagram processing failed: {c_res}")
+        time.sleep(10)
+
+    requests.post(f"{base}/{ig_id}/media_publish", data={
+        "creation_id": creation_id,
+        "access_token": token
+    }).raise_for_status()
+    print("Instagram Reel published!")
+
+
+if __name__ == "__main__":
+    token = get_twitch_token()
+    clip = get_top_clip(token)
+    if not clip:
+        print("No new GTA 6 clips found.")
+        exit(0)
+
+    print(f"Selected GTA 6 clip: [{clip['broadcaster_name']}] {clip['title']} ({int(clip['duration'])}s)")
+    transcript = process_video(clip["url"])
+    meta = generate_metadata(transcript, clip["broadcaster_name"], clip["title"])
+    upload_youtube(meta)
+
+    with open("meta.json", "w") as f:
+        json.dump({"clip_id": clip["id"], "ig_caption": meta["ig_caption"]}, f)
