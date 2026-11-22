@@ -159,24 +159,36 @@ def detect_facecam_box(video_path):
         with open("frame.jpg", "rb") as f:
             img_bytes = f.read()
 
-        resp = client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), locate_prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        data = json.loads(resp.text)
-        if not data.get("has_cam") or not data.get("box_2d"):
+        try:
+            resp = client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), locate_prompt],
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            data = json.loads(resp.text)
+            if isinstance(data, list) and data:
+                data = data[0]
+            if not isinstance(data, dict) or not data.get("has_cam") or not data.get("box_2d"):
+                continue
+
+            box = data["box_2d"]
+            # Unwrap nested list if Gemini returns [[ymin, xmin, ymax, xmax]]
+            if isinstance(box, list) and len(box) == 1 and isinstance(box[0], list):
+                box = box[0]
+            if not isinstance(box, list) or len(box) != 4:
+                continue
+
+            ymin, xmin, ymax, xmax = [float(v) for v in box]
+            xf = max(0.0, (xmin / 1000.0) - 0.02)
+            yf = max(0.0, (ymin / 1000.0) - 0.02)
+            wf = min(1.0 - xf, ((xmax - xmin) / 1000.0) + 0.04)
+            hf = min(1.0 - yf, ((ymax - ymin) / 1000.0) + 0.04)
+
+            if 0.06 <= wf <= 0.65 and 0.06 <= hf <= 0.65:
+                return (xf, yf, wf, hf)
+        except Exception as e:
+            print(f"Facecam check skipped at {ts}s: {e}")
             continue
-
-        ymin, xmin, ymax, xmax = data["box_2d"]
-        # Add slight padding so the streamer's head/shoulders aren't cut off
-        xf = max(0.0, (xmin / 1000.0) - 0.02)
-        yf = max(0.0, (ymin / 1000.0) - 0.02)
-        wf = min(1.0 - xf, ((xmax - xmin) / 1000.0) + 0.04)
-        hf = min(1.0 - yf, ((ymax - ymin) / 1000.0) + 0.04)
-
-        if 0.06 <= wf <= 0.65 and 0.06 <= hf <= 0.65:
-            return (xf, yf, wf, hf)
 
     return None
 
