@@ -129,13 +129,17 @@ def get_top_clip(token):
     Clips:
     {clip_list}
     """
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=pick_prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json")
-    )
-    idx = json.loads(resp.text).get("index", 0)
-    return top_pool[idx] if 0 <= idx < len(top_pool) else top_pool[0]
+    try:
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=pick_prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        idx = json.loads(resp.text).get("index", 0)
+        return top_pool[idx] if 0 <= idx < len(top_pool) else top_pool[0]
+    except Exception as e:
+        print(f"Gemini clip picker failed ({e}); picking top-viewed clip.")
+        return top_pool[0]
 
 
 def detect_facecam_box(video_path):
@@ -340,14 +344,42 @@ def generate_metadata(transcript, streamer_name, clip_title):
         Line 6: Blank line.
         Line 7: 9 targeted hashtags mixing broad + niche (#gta6 #gtavi #grandtheftauto6 #gtaclips #gamingreels #twitchclips #gamingshorts #rockstargames #{streamer_name}).
     """
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json")
-    )
-    meta = json.loads(resp.text)
-    meta["yt_tags"] = sanitize_yt_tags(meta.get("yt_tags", []), streamer_name)
-    return meta
+
+    for attempt in range(4):
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            meta = json.loads(resp.text)
+            meta["yt_tags"] = sanitize_yt_tags(meta.get("yt_tags", []), streamer_name)
+            return meta
+        except Exception as e:
+            wait = 5 * (2 ** attempt)
+            print(f"Gemini metadata attempt {attempt + 1} failed ({e}). Retrying in {wait}s...")
+            time.sleep(wait)
+
+    # Fallback if Gemini stays overloaded so the rendered video still uploads
+    print("Gemini unavailable after retries; using fallback metadata.")
+    clean_title = clip_title[:45].strip()
+    return {
+        "yt_title": f"{streamer_name}: {clean_title} #shorts",
+        "yt_description": (
+            f"Wild GTA 6 moment from {streamer_name}!\n"
+            f"Subscribe for daily GTA 6 moments!\n\n"
+            f"Credit: @{streamer_name} on Twitch\n\n"
+            f"#GTA6 #GTAVI #GrandTheftAuto6 #Shorts #GamingShorts #TwitchClips #{streamer_name}"
+        ),
+        "yt_tags": sanitize_yt_tags([], streamer_name),
+        "ig_caption": (
+            f"{streamer_name} really did that in GTA 6 😭\n"
+            f"Rate this moment 1-10 👇\n\n"
+            f"Follow for daily GTA 6 clips 🔥\n"
+            f"Credit: @{streamer_name} (Twitch)\n\n"
+            f"#gta6 #gtavi #grandtheftauto6 #gtaclips #gamingreels #twitchclips #gamingshorts #rockstargames #{streamer_name}"
+        ),
+    }
 
 
 def upload_youtube(meta):
