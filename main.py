@@ -15,6 +15,7 @@ from googleapiclient.http import MediaFileUpload
 # --- CONFIG ---
 WHITELIST_STREAMERS = ["caseoh_", "darkviperau", "summit1g", "loserfruit", "kaicenat"]
 TARGET_GAME_NAME = "Grand Theft Auto VI"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 POSTED_FILE = "posted_ids.json"
 
 # Words/slangs to automatically beep out in audio and censor in subtitles
@@ -129,7 +130,7 @@ def get_top_clip(token):
     {clip_list}
     """
     resp = client.models.generate_content(
-        model="gemini-3.5-flash-lite",
+        model=GEMINI_MODEL,
         contents=pick_prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json")
     )
@@ -161,7 +162,7 @@ def detect_facecam_box(video_path):
 
         try:
             resp = client.models.generate_content(
-                model="gemini-3.5-flash-lite",
+                model=GEMINI_MODEL,
                 contents=[types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), locate_prompt],
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
@@ -172,7 +173,6 @@ def detect_facecam_box(video_path):
                 continue
 
             box = data["box_2d"]
-            # Unwrap nested list if Gemini returns [[ymin, xmin, ymax, xmax]]
             if isinstance(box, list) and len(box) == 1 and isinstance(box[0], list):
                 box = box[0]
             if not isinstance(box, list) or len(box) != 4:
@@ -208,183 +208,7 @@ def format_srt_time(seconds):
 def process_video(clip_url):
     subprocess.run(["yt-dlp", "-f", "best[ext=mp4]/best", "-o", "raw.mp4", clip_url], check=True)
 
-    # 1. Transcribe with word-level timestamps to detect & beep bad words + build 3-word minimal captions
+    # 1. Transcribe with word-level timestamps for audio censorship + 3-word minimal captions
     model = WhisperModel("base", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(
-        "raw.mp4",
-        vad_filter=True,
-        vad_parameters={"threshold": 0.25, "min_silence_duration_ms": 400},
-        condition_on_previous_text=False,
-        word_timestamps=True
-    )
-    transcript_text = []
-    beep_ranges = []
-
-    with open("subs.srt", "w", encoding="utf-8") as srt:
-        idx = 1
-        for seg in segments:
-            if seg.words:
-                # Split into 3-word chunks so captions stay short and never cover the screen
-                for i in range(0, len(seg.words), 3):
-                    chunk = seg.words[i:i + 3]
-                    censored = []
-                    for w in chunk:
-                        if is_bad_word(w.word):
-                            beep_ranges.append((max(0.0, w.start - 0.05), w.end + 0.05))
-                            censored.append("****")
-                        else:
-                            censored.append(w.word.strip())
-                    text = " ".join(censored).strip()
-                    if not text:
-                        continue
-                    transcript_text.append(text)
-                    srt.write(
-                        f"{idx}\n{format_srt_time(chunk[0].start)} --> {format_srt_time(chunk[-1].end)}\n{text}\n\n"
-                    )
-                    idx += 1
-            else:
-                text = seg.text.strip()
-                if not text:
-                    continue
-                transcript_text.append(text)
-                srt.write(f"{idx}\n{format_srt_time(seg.start)} --> {format_srt_time(seg.end)}\n{text}\n\n")
-                idx += 1
-
-    print(f"Censored {len(beep_ranges)} offensive word(s).")
-
-    # 2. Auto-detect facecam box via Gemini Vision
-    cam_box = detect_facecam_box("raw.mp4")
-    sub_filter = (
-        ",subtitles=subs.srt:force_style='FontName=Arial,FontSize=11,Bold=1,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=0,Alignment=5'"
-        if transcript_text else ""
-    )
-
-    if cam_box:
-        xf, yf, wf, hf = cam_box
-        print(f"Facecam detected via Gemini Vision: x={xf:.2f}, y={yf:.2f}, w={wf:.2f}, h={hf:.2f}")
-        v_fc = (
-            f"[0:v]crop=iw*{wf:.4f}:ih*{hf:.4f}:iw*{xf:.4f}:ih*{yf:.4f},"
-            f"scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[cam];"
-            f"[0:v]scale=1080:1280:force_original_aspect_ratio=increase,crop=1080:1280[game];"
-            f"[cam][game]vstack=inputs=2{sub_filter}[outv]"
-        )
-    else:
-        print("No facecam detected; using clean full-screen 9:16 crop.")
-        v_fc = f"[0:v]crop=ih*9/16:ih,scale=1080:1920{sub_filter}[outv]"
-
-    # 3. Audio: beep out offensive words + loudness normalization + limiter
-    if beep_ranges:
-        cond = "+".join(f"between(t,{s:.2f},{e:.2f})" for s, e in beep_ranges)
-        a_fc = (
-            f"[0:a]volume=enable='{cond}':volume=0[muted];"
-            f"sine=frequency=1000:sample_rate=48000,volume=0.25,volume=enable='not({cond})':volume=0[beep];"
-            f"[muted][beep]amix=inputs=2:duration=first:dropout_transition=0,"
-            f"loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.8[outa]"
-        )
-    else:
-        a_fc = "[0:a]loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.8[outa]"
-
-    full_fc = f"{v_fc};{a_fc}"
-
-    subprocess.run([
-        "ffmpeg", "-y", "-i", "raw.mp4",
-        "-filter_complex", full_fc, "-map", "[outv]", "-map", "[outa]",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-ar", "48000", "-b:a", "128k",
-        "-movflags", "+faststart", "final.mp4"
-    ], check=True)
-
-    return " ".join(transcript_text)
-
-
-def generate_metadata(transcript, streamer_name, clip_title):
-    client = get_gemini_client()
-    prompt = f"""
-    You are a viral gaming shorts editor for GTA 6.
-    Streamer: {streamer_name}
-    Original Clip Title: {clip_title}
-    Transcript: {transcript}
-
-    Return ONLY valid JSON with these keys (keep all text family-friendly, no profanity):
-    - "yt_title": Punchy curiosity-driven title under 65 characters + #shorts
-    - "yt_description": 2 short lines of context + "Credit: @{streamer_name} on Twitch" + 4 GTA 6 hashtags
-    - "ig_caption": 1-line hook + blank line + "Credit: @{streamer_name} (Twitch)" + 4 GTA 6 hashtags
-    """
-    resp = client.models.generate_content(
-        model="gemini-3.5-flash-lite",
-        contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json")
-    )
-    return json.loads(resp.text)
-
-
-def upload_youtube(meta):
-    creds = Credentials(
-        token=None,
-        refresh_token=os.environ["YT_REFRESH_TOKEN"].strip(),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.environ["YT_CLIENT_ID"].strip(),
-        client_secret=os.environ["YT_CLIENT_SECRET"].strip()
-    )
-    yt = build("youtube", "v3", credentials=creds)
-    body = {
-        "snippet": {
-            "title": meta["yt_title"],
-            "description": meta["yt_description"],
-            "categoryId": "20"
-        },
-        "status": {"privacyStatus": "public"}
-    }
-    media = MediaFileUpload("final.mp4", mimetype="video/mp4", resumable=True)
-    yt.videos().insert(part="snippet,status", body=body, media_body=media).execute()
-    print("YouTube upload complete (Public).")
-
-
-def upload_instagram(public_video_url, caption):
-    ig_id = os.environ["IG_USER_ID"].strip()
-    token = os.environ["IG_ACCESS_TOKEN"].strip()
-    base = "https://graph.facebook.com/v21.0"
-
-    c_res = requests.post(f"{base}/{ig_id}/media", data={
-        "media_type": "REELS",
-        "video_url": public_video_url,
-        "caption": caption,
-        "share_to_feed": "true",
-        "access_token": token
-    }).json()
-    if "id" not in c_res:
-        raise RuntimeError(f"Instagram API Error: {c_res}")
-    creation_id = c_res["id"]
-
-    for _ in range(20):
-        status = requests.get(f"{base}/{creation_id}", params={
-            "fields": "status_code", "access_token": token
-        }).json().get("status_code")
-        if status == "FINISHED":
-            break
-        if status == "ERROR":
-            raise RuntimeError(f"Instagram processing failed: {c_res}")
-        time.sleep(10)
-
-    requests.post(f"{base}/{ig_id}/media_publish", data={
-        "creation_id": creation_id,
-        "access_token": token
-    }).raise_for_status()
-    print("Instagram Reel published!")
-
-
-if __name__ == "__main__":
-    token = get_twitch_token()
-    clip = get_top_clip(token)
-    if not clip:
-        print("No new GTA 6 clips found.")
-        exit(0)
-
-    print(f"Selected GTA 6 clip: [{clip['broadcaster_name']}] {clip['title']} ({int(clip['duration'])}s)")
-    transcript = process_video(clip["url"])
-    meta = generate_metadata(transcript, clip["broadcaster_name"], clip["title"])
-    upload_youtube(meta)
-
-    with open("meta.json", "w") as f:
-        json.dump({"clip_id": clip["id"], "ig_caption": meta["ig_caption"]}, f)
+        "raw.mp4
